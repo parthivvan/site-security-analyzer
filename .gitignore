@@ -1,0 +1,33 @@
+# Node / frontend
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env and secrets
+.env
+
+# Builds
+.dist/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+scans.json
+backend/scans.json
+*.db
+backend/*.db
+
+# Firebase
+.firebase/
+
+# Frontend env
+frontend/.env
+frontend/.env.local

@@ -1,0 +1,58 @@
+# Cloud Build pipeline: deploy Cloud Run backend and Firebase Hosting frontend
+# Substitutions you can set in trigger:
+#   _REGION: Cloud Run region (e.g., us-central1)
+#   _SERVICE: Cloud Run service name (default: site-security-analyzer-backend)
+#   _SECRET_KEY: Optional app secret; otherwise set in Cloud Run console
+#   _DATABASE_URL: Optional DB URL; otherwise set in Cloud Run console
+#   _FIREBASE_TOKEN: CI token for Firebase Hosting deploy (store in Secret Manager and map to env)
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE: site-security-analyzer-backend
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # 1) Deploy backend to Cloud Run from source in backend/
+  - name: gcr.io/cloud-builders/gcloud
+    id: Deploy Cloud Run Backend
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        gcloud run deploy "$${_SERVICE}" \
+          --source backend \
+          --region "$${_REGION}" \
+          --platform managed \
+          --allow-unauthenticated \
+          ${_SECRET_KEY:+--set-env-vars SECRET_KEY=$${_SECRET_KEY}} \
+          ${_DATABASE_URL:+--set-env-vars DATABASE_URL=$${_DATABASE_URL}}
+
+  # 2) Build frontend
+  - name: node:20
+    id: Build Frontend
+    entrypoint: bash
+    dir: frontend
+    args:
+      - -lc
+      - |
+        npm ci
+        npm run build
+
+  # 3) Deploy to Firebase Hosting
+  - name: node:20
+    id: Firebase Hosting Deploy
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        npx firebase-tools deploy --only hosting
+    env:
+      - "FIREBASE_TOKEN=${_FIREBASE_TOKEN}"
+
+artifacts:
+  objects:
+    location: gs://$PROJECT_ID-cloudbuild-artifacts/site-security-analyzer/
+    paths:
+      - frontend/dist/**
