@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: site-security-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    region: oregon
+    plan: free
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:///site.db
+      - key: PORT
+        value: 8080
+    healthCheckPath: /
