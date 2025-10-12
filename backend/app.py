@@ -76,6 +76,36 @@ def init_db():
         print("DB init error:", e)
 
 
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint - API information."""
+    return jsonify({
+        "service": "Site Security Analyzer API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "GET /health",
+            "scan": "POST /scan",
+            "auth": {
+                "signup": "POST /auth/signup",
+                "login": "POST /auth/login"
+            },
+            "agent": "POST /agent/analyze",
+            "billing": {
+                "checkout": "POST /billing/create-checkout-session",
+                "webhook": "POST /billing/webhook"
+            }
+        },
+        "docs": "https://github.com/parthivvan/site-security-analyzer"
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for Railway and other platforms."""
+    return jsonify({"status": "healthy", "service": "site-security-analyzer"}), 200
+
+
 @app.route("/agent/analyze", methods=["POST"])
 @limiter.limit("15 per minute")
 def agent_analyze():
@@ -154,11 +184,6 @@ def login():
     }
     token = jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
     return jsonify({"token": token, "user": {"id": user.id, "email": user.email}})
-
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check endpoint for Railway and other platforms."""
-    return jsonify({"status": "healthy", "service": "site-security-analyzer"}), 200
 
 
 @app.route("/scan", methods=["POST"])
