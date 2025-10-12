@@ -155,6 +155,12 @@ def login():
     token = jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
     return jsonify({"token": token, "user": {"id": user.id, "email": user.email}})
 
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for Railway and other platforms."""
+    return jsonify({"status": "healthy", "service": "site-security-analyzer"}), 200
+
+
 @app.route("/scan", methods=["POST"])
 def scan():
     data = request.get_json()
