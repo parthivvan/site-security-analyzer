@@ -12,8 +12,14 @@ import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-# CORS: allow localhost dev by default; tighten to your Firebase domain in prod
-CORS(app, resources={r"*": {"origins": ["http://localhost:5173", "https://site-security-analyzer.web.app", "https://site-security-analyzer.firebaseapp.com"]}})
+# CORS: allow localhost dev and production domains
+CORS(app, resources={r"*": {"origins": [
+    "http://localhost:5173",
+    "https://site-security-analyzer.web.app",
+    "https://site-security-analyzer.firebaseapp.com",
+    "https://site-security-analyzer.vercel.app",
+    "https://site-security-analyzer-production.up.railway.app"
+]}})
 
 # Configuration
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
