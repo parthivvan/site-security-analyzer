@@ -17,8 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./
 
+# Make start script executable
+RUN chmod +x start.sh
+
 # Railway sets PORT automatically
 EXPOSE 8080
 
-# Use shell form to allow variable expansion
-CMD gunicorn -b 0.0.0.0:${PORT:-8080} --workers 1 --threads 8 --timeout 0 app:app
+# Use start script
+CMD ["./start.sh"]

@@ -5,7 +5,6 @@
     "dockerfilePath": "./Dockerfile"
   },
   "deploy": {
-    "startCommand": "gunicorn -b :$PORT --workers 1 --threads 8 --timeout 0 app:app",
     "healthcheckPath": "/scan",
     "healthcheckTimeout": 100,
     "restartPolicyType": "ON_FAILURE",

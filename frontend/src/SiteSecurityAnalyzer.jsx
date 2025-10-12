@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from "react";
-import { Link, useSearchParams } from 'react-router-dom';
 import "./SiteSecurityAnalyzer.css"; // Import the CSS file
-import api from "./api";
 
 export default function SiteSecurityAnalyzer() {
+  const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
   const [url, setUrl] = useState("");
   const [result, setResult] = useState(null);
@@ -26,38 +25,28 @@ export default function SiteSecurityAnalyzer() {
     setToken(null);
   };
 
-  const handleScan = async (overrideUrl) => {
-    const target = (overrideUrl ?? url).trim();
-    if (!target) {
-      setResult({ error: "Please enter a website URL to scan." });
-      return;
-    }
+  const handleScan = async () => {
+    if (!url.trim()) return;
     setLoading(true);
     setResult(null);
     setShowDetails(false);
     try {
-      console.debug("Scanning", { apiBase: api.baseUrl, target });
-      const data = await api.post("/scan", { url: target }, { token });
+      const res = await fetch(`${API}/scan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
       setResult(data);
-    } catch (e) {
-      console.error("Scan failed", e);
-      setResult({ error: e.message || "Failed to scan site." });
+    } catch {
+      setResult({ error: "Failed to scan site." });
     } finally {
       setLoading(false);
     }
   };
-
-  // If navigated with ?url=..., auto-fill and auto-scan
-  const [searchParams] = useSearchParams();
-  useEffect(() => {
-    const qurl = searchParams.get('url');
-    if (qurl) {
-      setUrl(qurl);
-      // auto-run scan using provided URL
-      handleScan(qurl);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const handleAuth = async () => {
     setAuthMessage("");
@@ -67,19 +56,26 @@ export default function SiteSecurityAnalyzer() {
     }
     try {
       const path = authMode === "signup" ? "/auth/signup" : "/auth/login";
-      const data = await api.post(path, { email, password });
-      if (authMode === "login" && data?.token) {
+      const res = await fetch(`${API}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthMessage(data.error || "Auth failed");
+        return;
+      }
+      if (authMode === "login" && data.token) {
         localStorage.setItem("auth_token", data.token);
         setToken(data.token);
         setAuthMessage("Logged in successfully");
       } else if (authMode === "signup") {
         setAuthMessage("Signup successful. You can login now.");
         setAuthMode("login");
-      } else {
-        setAuthMessage("Auth succeeded");
       }
     } catch (e) {
-      setAuthMessage(e.message || "Request failed");
+      setAuthMessage("Request failed");
     }
   };
 
@@ -87,17 +83,48 @@ export default function SiteSecurityAnalyzer() {
     <div className="analyzer-container">
       <h1 className="title">Site Security Analyzer</h1>
 
-      <form className="input-section" onSubmit={(e)=>{ e.preventDefault(); if(!loading && url.trim()){ handleScan(); } }}>
+      {/* Auth Panel */}
+      <div className="auth-panel" style={{ marginBottom: 20 }}>
+        {token ? (
+          <div>
+            <span style={{ marginRight: 8 }}>Authenticated</span>
+            <button onClick={handleLogout}>Logout</button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <select value={authMode} onChange={(e) => setAuthMode(e.target.value)}>
+              <option value="login">Login</option>
+              <option value="signup">Signup</option>
+            </select>
+            <input
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <button onClick={handleAuth}>{authMode === "signup" ? "Create account" : "Login"}</button>
+            {authMessage && <span style={{ color: "#e44" }}>{authMessage}</span>}
+          </div>
+        )}
+      </div>
+
+      <div className="input-section">
         <input
           type="text"
           placeholder="Type a website here (e.g. example.com)"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
         />
-        <button type="submit" disabled={loading || !url.trim()}>
+        <button onClick={handleScan} disabled={loading}>
           {loading ? "🔎 Scanning..." : "🔎 Scan"}
         </button>
-      </form>
+      </div>
 
       {/* Friendly small controls */}
       <div className="kid-controls">
@@ -116,10 +143,6 @@ export default function SiteSecurityAnalyzer() {
             <p className="error-text">{result.error}</p>
           ) : (
             <>
-              {/* Actions row */}
-              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
-                <Link to="/history" className="btn ghost">View history</Link>
-              </div>
               {/* Friendly summary with emoji and simple language when ELI5 is on */}
               <div className="kid-summary">
                 <div className="kid-emoji">{result.report && result.report.https ? "🟢" : "🔴"}</div>

@@ -13,12 +13,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 # CORS: allow localhost dev by default; tighten to your Firebase domain in prod
-CORS(app, resources={r"*": {"origins": [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://site-security-analyzer.web.app",
-    "https://site-security-analyzer.firebaseapp.com"
-]}})
+CORS(app, resources={r"*": {"origins": ["http://localhost:5173", "https://site-security-analyzer.web.app", "https://site-security-analyzer.firebaseapp.com"]}})
 
 # Configuration
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -41,7 +36,7 @@ Talisman(
     },
 )
 
-HISTORY_FILE = "scans.json"  # legacy; replaced by DB but kept for backwards-compat
+HISTORY_FILE = "scans.json"
 
 # Models
 class User(db.Model):
@@ -56,49 +51,15 @@ class User(db.Model):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
-class Scan(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, nullable=True, index=True)
-    url = db.Column(db.String(2048), nullable=False)
-    report = db.Column(db.JSON, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, index=True)
-
 def save_scan(record):
-    """Persist a scan record in the database. Keep a best-effort JSON write for legacy."""
     try:
-        # DB write
-        scan = Scan(
-            user_id=record.get("user_id"),
-            url=record.get("url", ""),
-            report=record.get("report", {}),
-        )
-        db.session.add(scan)
-        db.session.commit()
-    except Exception as e:
-        print("DB save failed:", e)
-    # Best-effort legacy file append (non-fatal)
-    try:
-        legacy = []
+        data = []
         if os.path.exists(HISTORY_FILE):
-            legacy = json.load(open(HISTORY_FILE))
-        record.setdefault("created_at", datetime.datetime.utcnow().isoformat() + "Z")
-        legacy.append(record)
-        json.dump(legacy, open(HISTORY_FILE, "w"), indent=2)
+            data = json.load(open(HISTORY_FILE))
+        data.append(record)
+        json.dump(data, open(HISTORY_FILE, "w"), indent=2)
     except Exception as e:
-        print("Legacy file save failed:", e)
-
-
-def get_user_id_from_request():
-    """Extract user id from Bearer token if present; return None if invalid/missing."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return None
-    token = auth.split(" ", 1)[1].strip()
-    try:
-        payload = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-        return payload.get("sub")
-    except Exception:
-        return None
+        print("Failed to save:", e)
 
 
 def init_db():
@@ -204,24 +165,10 @@ def scan():
         url = "http://" + url
 
     try:
-        # Try to look like a regular browser to avoid basic bot challenges
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-        })
-
-        # Follow redirects to reach the canonical URL
-        r = session.get(url, timeout=8, allow_redirects=True)
+        r = requests.get(url, timeout=6)
         headers = dict(r.headers)
         report = {
             "url": url,
-            "final_url": getattr(r, "url", url),
             "status_code": r.status_code,
             "https": url.startswith("https://"),
             "server_header": headers.get("Server"),
@@ -233,13 +180,7 @@ def scan():
             "x_content_type_options": headers.get("X-Content-Type-Options"),
             "referrer_policy": headers.get("Referrer-Policy"),
         }
-        # If we did not get a 200 OK, note that results may reflect a block/challenge page
-        note = None
-        if r.status_code != 200:
-            note = (
-                f"Non-200 response ({r.status_code}). Headers may reflect an interstitial/challenge "
-                f"page from an edge/CDN rather than the origin app."
-            )
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -272,51 +213,11 @@ def scan():
     if report["server_header"]:
         explanation.append(f"Server header reveals: {report['server_header']}.")
 
-    # Build explanation and include non-200 note if present
     explanation_text = " ".join(explanation)
-    if 'note' in locals() and note:
-        explanation_text += f" Note: {note}"
 
-    user_id = get_user_id_from_request()
     out = {"report": report, "explanation": explanation_text}
-    save_scan({"url": url, "report": report, "user_id": user_id})
+    save_scan({"url": url, "report": report})
     return jsonify(out)
-
-# History endpoint: return scans for the authenticated user
-@app.route("/history", methods=["GET"])
-@limiter.limit("60 per minute")
-def history():
-    user_id = get_user_id_from_request()
-    if not user_id:
-        return jsonify({"error": "authentication required"}), 401
-
-    try:
-        # Prefer DB history
-        scans = (
-            Scan.query.filter_by(user_id=user_id)
-            .order_by(Scan.created_at.desc())
-            .all()
-        )
-        if scans:
-            out = []
-            for s in scans:
-                out.append({
-                    "created_at": s.created_at.isoformat() + "Z",
-                    "url": s.url,
-                    "report": s.report,
-                    "user_id": s.user_id,
-                })
-            return jsonify({"history": out})
-
-        # Fallback to legacy file if DB empty
-        records = []
-        if os.path.exists(HISTORY_FILE):
-            records = json.load(open(HISTORY_FILE))
-        user_records = [r for r in records if r.get("user_id") == user_id]
-        user_records.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-        return jsonify({"history": user_records})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     # Ensure DB is initialized when running the dev server
