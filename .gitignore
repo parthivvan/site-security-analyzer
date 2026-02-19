@@ -1,14 +1,27 @@
 # Node / frontend
 frontend/node_modules/
+node_modules/
 
-# Python
+# Python virtual environments
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+.venv_run/
 venv/
+env/
+.env/
 
-# Env and secrets
+# Env and secrets — NEVER commit real .env files
 .env
+.env.local
+.env.*.local
+backend/.env
+!.env.example
+!.env.production
+!backend/.env.example
+!frontend/.env.example
+!frontend/.env.production
 
 # Builds
 .dist/
@@ -18,12 +31,19 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+*.swp
+*~
 
-# Runtime data
+# Runtime / generated data
 scans.json
 backend/scans.json
+backend/scan_history.json
+backend/scan-results.json
+backend/scan-test.json
 *.db
-backend/*.db
+
+# SQLite instance databases
+backend/instance/
 
 # Firebase
 .firebase/
@@ -31,3 +51,7 @@ backend/*.db
 # Frontend env
 frontend/.env
 frontend/.env.local
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .form-group {
+            margin: 15px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            background: #f9f9f9;
+        }
+        .success {
+            background: #d4edda !important;
+            border-color: #c3e6cb !important;
+            color: #155724;
+        }
+        .error {
+            background: #f8d7da !important;
+            border-color: #f5c6cb !important;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>Login Debug Tool</h1>
+    
+    <form id="loginForm">
+        <div class="form-group">
+            <label for="email">Email:</label>
+            <input type="email" id="email" name="email" required autocomplete="email">
+        </div>
+        
+        <div class="form-group">
+            <label for="password">Password:</label>
+            <input type="password" id="password" name="password" required autocomplete="current-password">
+        </div>
+        
+        <button type="button" onclick="testDirectAPI()">Test Direct API</button>
+        <button type="button" onclick="testViaApiJS()">Test via api.js</button>
+        <button type="button" onclick="clearForm()">Clear</button>
+    </form>
+    
+    <div id="result"></div>
+    
+    <script>
+        function showResult(msg, isSuccess) {
+            const result = document.getElementById('result');
+            result.textContent = msg;
+            result.className = isSuccess ? 'success' : 'error';
+        }
+        
+        async function testDirectAPI() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            showResult('Sending request...', true);
+            
+            try {
+                const response = await fetch('http://127.0.0.1:5000/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ 
+                        email: email, 
+                        password: password 
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showResult(`SUCCESS!\nStatus: ${response.status}\nEmail sent: "${email}"\nPassword sent: "${password}"\nResponse: ${JSON.stringify(data, null, 2)}`, true);
+                } else {
+                    showResult(`FAILED!\nStatus: ${response.status}\nEmail sent: "${email}"\nPassword sent: "${password}"\nError: ${data.error || data.message || 'Unknown error'}`, false);
+                }
+            } catch (error) {
+                showResult(`ERROR!\nEmail: "${email}"\nPassword: "${password}"\nException: ${error.message}`, false);
+            }
+        }
+        
+        async function testViaApiJS() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            showResult('Loading api.js...', true);
+            
+            try {
+                // Dynamically import api.js
+                const api = await import('/src/api.js').then(m => m.default);
+                
+                showResult('Sending via api.login()...', true);
+                
+                const data = await api.login(email, password);
+                showResult(`SUCCESS via api.js!\nEmail: "${email}"\nPassword: "${password}"\nEmail after sanitize: "${api.sanitizeInput(email)}"\nResponse: ${JSON.stringify(data, null, 2)}`, true);
+            } catch (error) {
+                showResult(`FAILED via api.js!\nEmail: "${email}"\nPassword: "${password}"\nError: ${error.message}`, false);
+            }
+        }
+        
+        function clearForm() {
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+            document.getElementById('result').textContent = '';
+            document.getElementById('result').className = '';
+        }
+        
+        // Pre-fill with test credentials
+        document.getElementById('email').value = 'parthivvanapalli@gmail.com';
+    </script>
+</body>
+</html>

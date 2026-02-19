@@ -1,0 +1,108 @@
+"""
+GitHub Actions Workflow for CI/CD
+Automated security scanning on every PR
+"""
+
+name: AntiGravity Security Scan
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements-advanced.txt
+      
+      - name: Run AntiGravity Scanner
+        env:
+          SCAN_TARGET: ${{ secrets.STAGING_URL || 'https://staging.yourapp.com' }}
+          API_KEY: ${{ secrets.ANTIGRAVITY_API_KEY }}
+        run: |
+          python backend/scripts/ci_scan.py \
+            --target $SCAN_TARGET \
+            --output scan-results.json \
+            --fail-on critical,high
+      
+      - name: Upload scan results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-scan-results
+          path: scan-results.json
+      
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('scan-results.json', 'utf8'));
+            
+            const { summary } = results;
+            const emoji = summary.critical > 0 ? '🆘' : 
+                         summary.high > 0 ? '⚠️' : '✅';
+            
+            const comment = `## ${emoji} Security Scan Results
+            
+            **Summary:**
+            - 🔴 Critical: ${summary.critical}
+            - 🟠 High: ${summary.high}
+            - 🟡 Medium: ${summary.medium}
+            - 🔵 Low: ${summary.low}
+            
+            **Total Vulnerabilities Found:** ${summary.total_vulnerabilities}
+            
+            ${summary.critical > 0 || summary.high > 0 ? 
+              '❌ **This PR introduces critical or high severity vulnerabilities and cannot be merged.**' :
+              '✅ No critical issues found. Safe to merge.'}
+            
+            <details>
+            <summary>View detailed findings</summary>
+            
+            ${results.vulnerabilities.slice(0, 10).map(v => `
+            ### ${v.title}
+            - **Severity:** ${v.severity}
+            - **Type:** ${v.type}
+            - **URL:** ${v.url}
+            - **Remediation:** ${v.remediation}
+            `).join('\n')}
+            
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Fail if critical vulnerabilities found
+        run: |
+          python -c "
+          import json, sys
+          results = json.load(open('scan-results.json'))
+          if results['summary']['critical'] > 0 or results['summary']['high'] > 0:
+              print('❌ Critical or high severity vulnerabilities found!')
+              sys.exit(1)
+          print('✅ Security scan passed')
+          "

@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global styles for Site Security Analyzer */
+
+@layer base {
+  body {
+    @apply font-sans antialiased;
+  }
+}
+
+@layer components {
+  .btn-brutal {
+    @apply font-bold py-2 px-4 border-2 border-brutal-black dark:border-gray-600 transition-all;
+    @apply hover:translate-x-0.5 hover:translate-y-0.5;
+  }
+
+  .input-brutal {
+    @apply border-2 border-brutal-black dark:border-gray-600 px-4 py-2;
+    @apply focus:outline-none focus:ring-2 focus:ring-brutal-blue;
+    @apply bg-white dark:bg-gray-800 text-brutal-black dark:text-gray-100;
+  }
+
+  .card-brutal {
+    @apply border-2 border-brutal-black dark:border-gray-600;
+    @apply shadow-brutal;
+  }
+}
+
+@layer utilities {
+  .shadow-brutal {
+    box-shadow: 4px 4px 0 #121212;
+  }
+
+  .shadow-brutal-lg {
+    box-shadow: 8px 8px 0 #121212;
+  }
+
+  .shadow-brutal-sm {
+    box-shadow: 2px 2px 0 #121212;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .shadow-brutal {
+      box-shadow: 4px 4px 0 #374151;
+    }
+    
+    .shadow-brutal-lg {
+      box-shadow: 8px 8px 0 #374151;
+    }
+    
+    .shadow-brutal-sm {
+      box-shadow: 2px 2px 0 #374151;
+    }
+  }
+
+  .animate-slide-up {
+    animation: slide-up 0.3s ease-out;
+  }
+
+  @keyframes slide-up {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* Scrollbar styling */
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #d1d5db;
+    border-radius: 3px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: #9ca3af;
+  }
+}

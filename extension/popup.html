@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SSA - Site Security Analyzer</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="header-left">
+        <span class="logo">🔒</span>
+        <div>
+          <h1>SSA</h1>
+          <span class="badge">v2.0</span>
+        </div>
+      </div>
+      <button id="themeBtn" class="theme-btn" title="Toggle dark mode">🌙</button>
+    </header>
+
+    <!-- Auth: Login Form (shown when not logged in) -->
+    <div id="authSection">
+      <form id="loginForm" class="auth-form">
+        <input type="email" id="email" placeholder="Email" required class="input-field">
+        <input type="password" id="password" placeholder="Password" required class="input-field">
+        <button type="submit" class="btn btn-primary">Sign In</button>
+        <div id="loginError" class="error-text"></div>
+      </form>
+    </div>
+
+    <!-- Auth: Logged-in state -->
+    <div id="logoutSection" class="logout-bar hidden">
+      <span id="userEmail" class="user-email"></span>
+      <button id="logoutBtn" class="btn btn-small btn-danger">Logout</button>
+    </div>
+
+    <!-- Status -->
+    <div id="status" class="status-box">Sign in to scan the current tab.</div>
+
+    <!-- Scan Button -->
+    <button id="scanBtn" class="btn btn-scan" disabled>⚡ ANALYZE THIS SITE</button>
+
+    <!-- Results -->
+    <div id="results" class="results hidden">
+      <div class="score-section">
+        <div id="scoreCircle" class="score-circle">
+          <span id="scoreValue" class="score-value">0%</span>
+        </div>
+        <div id="scoreLabel" class="score-label">—</div>
+      </div>
+      <div id="details" class="details"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
