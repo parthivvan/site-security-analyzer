@@ -81,7 +81,7 @@ export default function Signup() {
         setBusy(true);
         setMsg('');
         try {
-            await api.post('/auth/signup', { email, password });
+            await api.post('/auth/signup', { email, password }, { skipAuth: true });
             setMsg('✅ Account created! Redirecting to login...');
             setMsgType('success');
             setTimeout(() => {

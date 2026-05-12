@@ -5,20 +5,19 @@ import api from './api';
 /** Compute a 0-100 security score from the raw report object returned by the API */
 function computeScore(report) {
   if (!report) return 0;
-  let score = 50;
-  if (report.https) score += 15;
-  if (report.hsts) score += 10;
-  if (report.content_security_policy) score += 10;
-  if (report.x_frame_options) score += 5;
-  else score -= 5;
+  let score = 0;
+  if (report.https) score += 25;
+  if (report.hsts) score += 15;
+  if (report.content_security_policy) score += 15;
+  if (report.x_frame_options) score += 10;
   if (report.x_content_type_options) score += 5;
-  else score -= 5;
   if (report.referrer_policy) score += 5;
-  else score -= 3;
   if (report.permissions_policy) score += 5;
   if (report.dns_spf) score += 5;
   if (report.dns_dmarc) score += 5;
-  if (report.server_header) score -= 3;
+  if (report.cookies) score += 5;
+  if (report.server_header) score -= 5;
+  if (report.mixed_content) score -= 5;
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
@@ -35,7 +34,9 @@ function countIssues(report) {
     report.permissions_policy,
     report.dns_spf,
     report.dns_dmarc,
+    report.cookies,
     !report.server_header,
+    !report.mixed_content,
   ];
   const passed = checks.filter(Boolean).length;
   return { passed, failed: checks.length - passed };

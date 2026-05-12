@@ -10,6 +10,10 @@ import ipaddress
 import datetime
 import secrets
 import logging
+import hashlib
+import traceback
+from sqlalchemy import inspect
+from sqlalchemy.exc import OperationalError
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse
 from functools import wraps
@@ -28,6 +32,7 @@ from pythonjsonlogger import jsonlogger
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 from prometheus_flask_exporter import PrometheusMetrics
+from core.report_builder import build_flat_report, compute_score_from_flat_report, enrich_scan_result
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -50,6 +55,24 @@ if not SECRET_KEY or len(SECRET_KEY) < 64:
 
 app.config["SECRET_KEY"] = SECRET_KEY
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+
+def _utcnow() -> datetime.datetime:
+    """Naive UTC datetime for DB columns; compatible with SQLite and PostgreSQL."""
+    return datetime.datetime.utcnow()
+
+
+def _utcnow_aware() -> datetime.datetime:
+    """Timezone-aware UTC datetime for JWT payloads only."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _hash_token(token: str) -> str:
+    """One-way hash for refresh/reset token storage."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+_DUMMY_HASH = generate_password_hash("dummy-timing-normalization-value-do-not-use")
 
 # Database Configuration
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -89,9 +112,16 @@ except Exception as _redis_err:
     print(f"Redis: unavailable ({_redis_err}) — caching disabled, using sync scan mode")
 
 # CORS Configuration
-allowed_origins = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173").split(",")]
+# IMPORTANT: when supports_credentials=True you must list explicit origins — wildcard (*) is rejected by browsers.
+allowed_origins = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")]
 print(f"CORS allowed origins: {allowed_origins}")
-CORS(app, resources={r"/*": {"origins": allowed_origins}}, supports_credentials=True)
+CORS(
+    app,
+    resources={r"/*": {"origins": allowed_origins}},
+    supports_credentials=False,  # tokens stored in JS storage, not cookies
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
 
 # Rate Limiting - use memory storage if Redis is not available
 # Disable rate limiting in development to avoid blocking local testing
@@ -223,7 +253,7 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     last_login = db.Column(db.DateTime)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     
@@ -251,7 +281,7 @@ class User(db.Model):
     def is_locked(self) -> bool:
         """Check if account is temporarily locked."""
         if self.account_locked_until:
-            if datetime.datetime.utcnow() < self.account_locked_until:
+            if _utcnow() < self.account_locked_until:
                 return True
             # Unlock account
             self.account_locked_until = None
@@ -269,7 +299,7 @@ class RefreshToken(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     token = db.Column(db.String(255), unique=True, nullable=False, index=True)
     expires_at = db.Column(db.DateTime, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     revoked = db.Column(db.Boolean, default=False, nullable=False)
     revoked_at = db.Column(db.DateTime)
     
@@ -287,7 +317,7 @@ class Scan(db.Model):
     domain = db.Column(db.String(255), nullable=False, index=True)
     report = db.Column(db.Text, nullable=False)  # JSON
     score = db.Column(db.Integer, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
     scan_duration_ms = db.Column(db.Integer)
     
     __table_args__ = (
@@ -347,8 +377,11 @@ def validate_url_safe(url: str) -> Tuple[bool, str, Optional[str]]:
                 
                 ip_obj = ipaddress.ip_address(ip_str)
                 
+                # Allow IPv6 NAT64 prefix (64:ff9b::/96) which is considered reserved by ipaddress but is public
+                is_nat64 = isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj in ipaddress.IPv6Network('64:ff9b::/96')
+                
                 # Block private, loopback, link-local, multicast, reserved
-                if (ip_obj.is_private or ip_obj.is_loopback or 
+                if not is_nat64 and (ip_obj.is_private or ip_obj.is_loopback or 
                     ip_obj.is_link_local or ip_obj.is_multicast or 
                     ip_obj.is_reserved):
                     return False, url, f"Access to private/internal addresses not allowed ({ip_str})"
@@ -403,8 +436,8 @@ def generate_access_token(user_id: int, email: str) -> str:  # noqa: E302
         "sub": str(user_id),  # PyJWT 2.x: 'sub' must be a string (RFC 7519)
         "email": email,
         "type": "access",
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15),
-        "iat": datetime.datetime.utcnow(),
+        "exp": _utcnow_aware() + datetime.timedelta(minutes=15),
+        "iat": _utcnow_aware(),
     }
     return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
 
@@ -412,11 +445,11 @@ def generate_access_token(user_id: int, email: str) -> str:  # noqa: E302
 def generate_refresh_token(user: User) -> str:
     """Generate and store refresh token (7 days)."""
     token = secrets.token_urlsafe(64)
-    expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    expires_at = _utcnow() + datetime.timedelta(days=7)
     
     refresh_token = RefreshToken(
         user_id=user.id,
-        token=token,
+        token=_hash_token(token),
         expires_at=expires_at
     )
     db.session.add(refresh_token)
@@ -480,7 +513,7 @@ def auth_required(f):
 def before_request():
     """Add request ID and start time."""
     g.request_id = request.headers.get('X-Request-ID', secrets.token_urlsafe(16))
-    g.start_time = datetime.datetime.utcnow()
+    g.start_time = _utcnow()
     
     logger.info('request_started', extra={
         'request_id': g.request_id,
@@ -493,7 +526,8 @@ def before_request():
 @app.after_request
 def after_request(response):
     """Log request completion."""
-    duration_ms = (datetime.datetime.utcnow() - g.start_time).total_seconds() * 1000
+    start = getattr(g, 'start_time', _utcnow())
+    duration_ms = (_utcnow() - start).total_seconds() * 1000
     
     logger.info('request_completed', extra={
         'request_id': g.request_id,
@@ -525,10 +559,20 @@ def handle_exception(e):
         'path': request.path
     })
     
+    if isinstance(e, OperationalError):
+        return jsonify({
+            "error": "Database schema is not initialized. Restart the backend or run migrations.",
+            "code": "database_schema_missing"
+        }), 500
+
     if is_production:
         return jsonify({"error": "Internal server error"}), 500
     else:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }), 500
 
 
 # =====================================================================
@@ -562,14 +606,16 @@ def health():
         status_code = 503
     
     # Check Redis
-    try:
-        redis_client.ping()
-        health_status["checks"]["redis"] = "ok"
-    except Exception as e:
-        health_status["checks"]["redis"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
-        if status_code == 200:
-            status_code = 200  # Redis failure is not critical
+    if redis_client is None:
+        health_status["checks"]["redis"] = "unavailable (not configured)"
+    else:
+        try:
+            redis_client.ping()
+            health_status["checks"]["redis"] = "ok"
+        except Exception as e:
+            health_status["checks"]["redis"] = f"error: {str(e)}"
+            health_status["status"] = "degraded"
+            # Redis failure is not critical — app still works
     
     return jsonify(health_status), status_code
 
@@ -596,8 +642,7 @@ def signup():
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     
-    # DEBUG: Log received credentials (password length and repr for debugging)
-    logger.info(f"Signup attempt - Email: {email}, Password length: {len(password)}, Password repr: {repr(password)}")
+    logger.info(f"Signup attempt for email: {email}")
     
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
@@ -611,28 +656,16 @@ def signup():
     if not is_strong:
         return jsonify({"error": error_msg}), 400
     
-    # Check if user exists (with timing attack protection)
-    import time, random
-    start = time.time()
-    
     existing = User.query.filter_by(email=email).first()
-    
-    # Add random delay to prevent timing attacks
-    elapsed = time.time() - start
-    if elapsed < 0.1:
-        time.sleep(0.1 - elapsed + random.uniform(0, 0.05))
-    
     if existing:
-        # SECURITY: Return same message as success to prevent email enumeration
         logger.warning(f"Signup attempt for existing email: {email}")
-        return jsonify({"message": "Account created successfully. Please check your email."}), 201
+        return jsonify({"error": "An account with this email already exists. Please log in."}), 409
     
     # Create user
     user = User(email=email)
     user.set_password(password)
     
-    # DEBUG: Log the generated hash
-    logger.info(f"User created for {email} - Password hash: {user.password_hash[:30]}...")
+    logger.info(f"User object prepared for registration: {email}")
     
     try:
         db.session.add(user)
@@ -655,19 +688,15 @@ def login():
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     
-    # DEBUG: Log received credentials (password length and repr for debugging)
-    logger.info(f"Login attempt - Email: {email}, Password length: {len(password)}, Password repr: {repr(password)}")
+    logger.info(f"Login attempt for email: {email}")
     
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
     
     user = User.query.filter_by(email=email).first()
-    
-    # Constant-time response to prevent user enumeration
-    import time, random
-    time.sleep(random.uniform(0.1, 0.3))
-    
+
     if not user:
+        check_password_hash(_DUMMY_HASH, password)
         return jsonify({"error": "Invalid credentials"}), 401
     
     # Check if account is locked
@@ -676,15 +705,14 @@ def login():
     
     # Check password
     if not user.check_password(password):
-        # DEBUG: Log failed password check
-        logger.warning(f"Password check failed for {email} - Password length: {len(password)}, Hash: {user.password_hash[:30]}...")
+        logger.warning(f"Password check failed for {email}")
         
         # Increment failed attempts
         user.failed_login_attempts += 1
         
         # Lock account after 5 failed attempts
         if user.failed_login_attempts >= 5:
-            user.account_locked_until = datetime.datetime.utcnow() + datetime.timedelta(minutes=30)
+            user.account_locked_until = _utcnow() + datetime.timedelta(minutes=30)
             logger.warning(f"Account locked due to failed login attempts: {email}")
         
         db.session.commit()
@@ -697,7 +725,7 @@ def login():
     # Successful login - reset failed attempts
     user.failed_login_attempts = 0
     user.account_locked_until = None
-    user.last_login = datetime.datetime.utcnow()
+    user.last_login = _utcnow()
     db.session.commit()
     
     # Generate tokens
@@ -742,7 +770,7 @@ def refresh():
     
     # Find refresh token
     refresh_token = RefreshToken.query.filter_by(
-        token=refresh_token_str,
+        token=_hash_token(refresh_token_str),
         revoked=False
     ).first()
     
@@ -750,7 +778,7 @@ def refresh():
         return jsonify({"error": "Invalid refresh token"}), 401
     
     # Check expiry
-    if datetime.datetime.utcnow() > refresh_token.expires_at:
+    if _utcnow() > refresh_token.expires_at:
         return jsonify({"error": "Refresh token expired"}), 401
     
     # Get user
@@ -778,13 +806,13 @@ def logout():
     if refresh_token_str:
         # Revoke specific refresh token
         refresh_token = RefreshToken.query.filter_by(
-            token=refresh_token_str,
+            token=_hash_token(refresh_token_str),
             user_id=g.user_id
         ).first()
         
         if refresh_token:
             refresh_token.revoked = True
-            refresh_token.revoked_at = datetime.datetime.utcnow()
+            refresh_token.revoked_at = _utcnow()
             db.session.commit()
     
     return jsonify({"message": "Logged out successfully"}), 200
@@ -802,15 +830,11 @@ def forgot_password():
     
     user = User.query.filter_by(email=email).first()
     
-    # Always return same response to prevent email enumeration
-    import time, random
-    time.sleep(random.uniform(0.2, 0.4))
-    
     if user and user.is_active:
         # Generate secure reset token
         reset_token = secrets.token_urlsafe(32)
-        user.reset_token = reset_token
-        user.reset_token_expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        user.reset_token = _hash_token(reset_token)
+        user.reset_token_expiry = _utcnow() + datetime.timedelta(hours=1)
         user.reset_token_used_at = None
         db.session.commit()
         
@@ -841,13 +865,13 @@ def reset_password():
     if not is_strong:
         return jsonify({"error": error_msg}), 400
     
-    user = User.query.filter_by(reset_token=token).first()
+    user = User.query.filter_by(reset_token=_hash_token(token)).first()
     
     if not user:
         return jsonify({"error": "Invalid or expired token"}), 400
     
     # Check token expiry
-    if user.reset_token_expiry < datetime.datetime.utcnow():
+    if user.reset_token_expiry < _utcnow():
         return jsonify({"error": "Invalid or expired token"}), 400
     
     # Check if token was already used
@@ -856,7 +880,7 @@ def reset_password():
     
     # Update password
     user.set_password(new_password)
-    user.reset_token_used_at = datetime.datetime.utcnow()
+    user.reset_token_used_at = _utcnow()
     user.reset_token = None  # Clear token
     user.failed_login_attempts = 0  # Reset failed attempts
     user.account_locked_until = None  # Unlock account
@@ -864,7 +888,7 @@ def reset_password():
     # Revoke all refresh tokens (force re-login)
     RefreshToken.query.filter_by(user_id=user.id, revoked=False).update({
         'revoked': True,
-        'revoked_at': datetime.datetime.utcnow()
+        'revoked_at': _utcnow()
     })
     
     db.session.commit()
@@ -943,7 +967,8 @@ def scan():
             return jsonify(json.loads(cached)), 200
 
     # ── Async path (Celery available) ──────────────────────────────────────
-    if REDIS_AVAILABLE:
+    use_celery = os.environ.get("USE_CELERY", "false").lower() == "true"
+    if REDIS_AVAILABLE and use_celery:
         try:
             from celery_tasks import perform_security_scan
             task = perform_security_scan.delay(normalized_url, g.user_id)
@@ -960,73 +985,53 @@ def scan():
     try:
         from celery_tasks import (
             create_safe_session, analyze_security_headers,
-            analyze_cookies, check_dns_records, calculate_overall_score
+            analyze_cookies, analyze_page_content, check_dns_records
         )
         import time as _time
 
         start_time = _time.time()
         session = create_safe_session()
-        response = session.get(
+        max_response_size = int(os.environ.get('MAX_RESPONSE_SIZE_MB', 10)) * 1024 * 1024
+        with session.get(
             normalized_url,
             timeout=(5, 10),
             allow_redirects=True,
             stream=True
-        )
-        content = response.raw.read(1 * 1024 * 1024, decode_content=True)  # 1 MB max
-        headers = dict(response.headers)
+        ) as response:
+            content = response.raw.read(max_response_size + 1, decode_content=True)
+            if len(content) > max_response_size:
+                return jsonify({"error": "Response too large"}), 400
+            raw_headers = response.headers
+            cookie_headers = getattr(response.raw, 'headers', response.headers)
+            final_url = response.url
+            status_code = response.status_code
 
-        header_findings = analyze_security_headers(headers, response.url)
-        cookie_findings = analyze_cookies(headers)
+        header_findings = analyze_security_headers(raw_headers, final_url)
+        cookie_findings = analyze_cookies(cookie_headers)
+        content_findings = analyze_page_content(content, final_url)
         dns_findings    = check_dns_records(domain)
 
-        all_findings = {"headers": header_findings, "cookies": cookie_findings, "dns": dns_findings}
-        score = calculate_overall_score({**header_findings, **cookie_findings, **dns_findings})
-
-        # Build flat report that frontend computeScore() expects
-        flat_report = {
-            "https":                   header_findings.get("https", {}).get("present", False),
-            "hsts":                    header_findings.get("hsts", {}).get("present", False),
-            "content_security_policy": header_findings.get("csp", {}).get("present", False),
-            "x_frame_options":         header_findings.get("x_frame_options", {}).get("present", False),
-            "x_content_type_options":  header_findings.get("x_content_type_options", {}).get("present", False),
-            "referrer_policy":         header_findings.get("referrer_policy", {}).get("present", False),
-            "permissions_policy":      header_findings.get("permissions_policy", {}).get("present", False),
-            "server_header":           header_findings.get("server_disclosure", {}).get("present", False),
-            "dns_spf":                 dns_findings.get("spf", {}).get("present", False),
-            "dns_dmarc":               dns_findings.get("dmarc", {}).get("present", False),
+        all_findings = {
+            "headers": header_findings,
+            "cookies": cookie_findings,
+            "dns": dns_findings,
+            "content": content_findings,
         }
-
-        # Build explanation
-        label_map = {
-            "https": "HTTPS", "hsts": "HSTS", "content_security_policy": "CSP",
-            "x_frame_options": "X-Frame-Options", "x_content_type_options": "X-Content-Type-Options",
-            "referrer_policy": "Referrer-Policy", "permissions_policy": "Permissions-Policy",
-            "dns_spf": "SPF", "dns_dmarc": "DMARC",
-        }
-        passed = [label_map.get(k, k) for k, v in flat_report.items() if k != "server_header" and v]
-        failed = [label_map.get(k, k) for k, v in flat_report.items() if k != "server_header" and not v]
-        grade = "Excellent" if score >= 80 else "Good" if score >= 60 else "Moderate" if score >= 40 else "Critical"
-        explanation = (
-            f"<strong>Security Grade: {grade} ({score}/100)</strong><br>"
-            f"<strong>Passed ({len(passed)}):</strong> {', '.join(passed) or 'None'}<br>"
-            f"<strong>Failed ({len(failed)}):</strong> {', '.join(failed) or 'None'}"
-            + (" <br><em>&#9888; Server version is disclosed in response headers.</em>" if flat_report.get("server_header") else "")
-        )
+        flat_report = build_flat_report(header_findings, dns_findings, cookie_findings, content_findings)
+        score = compute_score_from_flat_report(flat_report)
 
         duration_ms = int((_time.time() - start_time) * 1000)
 
         result = {
             "url": normalized_url,
             "domain": domain,
-            "score": score,
-            "report": flat_report,
             "findings": all_findings,
-            "explanation": explanation,
-            "final_url": response.url,
-            "status_code": response.status_code,
+            "final_url": final_url,
+            "status_code": status_code,
             "scan_duration_ms": duration_ms,
-            "scanned_at": datetime.datetime.utcnow().isoformat()
+            "scanned_at": _utcnow().isoformat()
         }
+        result = enrich_scan_result(result, flat_report, score)
 
         # Save to database
         try:
@@ -1056,28 +1061,33 @@ def scan():
 @auth_required
 def scan_status(task_id):
     """Check status of queued scan."""
-    from celery_tasks import celery
-    from celery.result import AsyncResult
-    
-    task = AsyncResult(task_id, app=celery)
-    
-    if task.ready():
-        if task.successful():
-            result = task.result
-            return jsonify({
-                "status": "complete",
-                "result": result
-            }), 200
-        else:
-            return jsonify({
-                "status": "failed",
-                "error": str(task.info)
-            }), 200
-    else:
+    use_celery = os.environ.get("USE_CELERY", "false").lower() == "true"
+    if not REDIS_AVAILABLE or not use_celery:
         return jsonify({
-            "status": "processing",
-            "progress": task.info.get('progress', 0) if isinstance(task.info, dict) else 0
-        }), 200
+            "status": "failed",
+            "error": "Async scan mode is not enabled on this server"
+        }), 400
+
+    try:
+        from celery_tasks import celery
+        from celery.result import AsyncResult
+
+        task = AsyncResult(task_id, app=celery)
+        if task.state == 'FAILURE':
+            return jsonify({"status": "failed", "error": str(task.info)}), 200
+
+        if task.ready():
+            result = task.result
+            if isinstance(result, dict) and result.get('error'):
+                return jsonify({"status": "failed", "error": result['error']}), 200
+            return jsonify({"status": "complete", "result": result}), 200
+
+        progress = task.info.get('progress', 0) if isinstance(task.info, dict) else 0
+        stage = task.info.get('stage', 'Processing') if isinstance(task.info, dict) else 'Processing'
+        return jsonify({"status": "processing", "progress": progress, "stage": stage}), 200
+    except Exception as e:
+        logger.error(f"Celery status check failed: {e}")
+        return jsonify({"status": "failed", "error": "Could not check task status"}), 500
 
 
 # =====================================================================
@@ -1085,11 +1095,23 @@ def scan_status(task_id):
 # =====================================================================
 
 def init_db():
-    """Create database tables."""
+    """Create database tables and verify the expected schema exists."""
     try:
         with app.app_context():
             db.create_all()
-            logger.info("Database tables created")
+
+            required_tables = {"users", "refresh_tokens", "scans"}
+            existing_tables = set(inspect(db.engine).get_table_names())
+            missing_tables = required_tables - existing_tables
+
+            if missing_tables:
+                logger.warning(
+                    "Database schema missing tables after create_all: %s. Existing tables: %s",
+                    sorted(missing_tables),
+                    sorted(existing_tables),
+                )
+            else:
+                logger.info("Database schema ready")
     except Exception as e:
         logger.error(f"DB init error: {e}")
 

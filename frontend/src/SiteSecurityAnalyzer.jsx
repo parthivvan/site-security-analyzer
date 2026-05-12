@@ -105,20 +105,19 @@ export default function SiteSecurityAnalyzer() {
   // Identical to computeScore in History.jsx — keep both in sync.
   const calculateScore = (report) => {
     if (!report) return 0;
-    let score = 50;
-    if (report.https) score += 15;
-    if (report.hsts) score += 10;
-    if (report.content_security_policy) score += 10;
-    if (report.x_frame_options) score += 5;
-    else score -= 5;
+    let score = 0;
+    if (report.https) score += 25;
+    if (report.hsts) score += 15;
+    if (report.content_security_policy) score += 15;
+    if (report.x_frame_options) score += 10;
     if (report.x_content_type_options) score += 5;
-    else score -= 5;
     if (report.referrer_policy) score += 5;
-    else score -= 3;
     if (report.permissions_policy) score += 5;
     if (report.dns_spf) score += 5;
     if (report.dns_dmarc) score += 5;
-    if (report.server_header) score -= 3;
+    if (report.cookies) score += 5;
+    if (report.server_header) score -= 5;
+    if (report.mixed_content) score -= 5;
     return Math.max(0, Math.min(100, Math.round(score)));
   };
 
@@ -127,6 +126,7 @@ export default function SiteSecurityAnalyzer() {
 
   const scoreLabel = (s) => s >= 80 ? 'EXCELLENT' : s >= 60 ? 'GOOD' : s >= 40 ? 'MODERATE' : 'CRITICAL';
   const scoreBg = (s) => s >= 80 ? 'bg-green-500 text-black' : s >= 60 ? 'bg-blue-500 text-white' : s >= 40 ? 'bg-yellow-400 text-black' : 'bg-red-500 text-white';
+  const isPassingCheck = (key, value) => ['server_header', 'mixed_content'].includes(key) ? !value : !!value;
 
   return (
     <div className="min-h-screen bg-white dark:bg-gray-900 p-4 md:p-8 font-sans text-gray-900 dark:text-gray-100">
@@ -179,6 +179,24 @@ export default function SiteSecurityAnalyzer() {
                       <div className="font-bold text-base md:text-lg">
                         {scoreLabel(score)}
                       </div>
+                      {result.risk_snapshot && (
+                        <div className="mt-5 w-full text-left border-t-2 border-black dark:border-gray-600 pt-4">
+                          <p className="font-mono text-xs font-bold mb-2">RISK SNAPSHOT</p>
+                          <p className="text-sm leading-relaxed text-gray-700 dark:text-gray-300">
+                            {result.risk_snapshot.headline}
+                          </p>
+                          <div className="grid grid-cols-2 gap-2 mt-4 font-mono text-xs">
+                            <div className="border-2 border-black dark:border-gray-600 p-2">
+                              <div className="font-bold">{result.risk_snapshot.critical_or_high_count}</div>
+                              <div>urgent</div>
+                            </div>
+                            <div className="border-2 border-black dark:border-gray-600 p-2">
+                              <div className="font-bold">{result.risk_snapshot.quick_win_count}</div>
+                              <div>quick wins</div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <div className="lg:col-span-2 flex flex-col gap-4 md:gap-6 lg:gap-8">
@@ -189,6 +207,34 @@ export default function SiteSecurityAnalyzer() {
                         <div className="p-3 md:p-4 bg-gray-50 dark:bg-gray-800 border-2 border-black dark:border-gray-600 mb-4 md:mb-6 font-mono text-xs md:text-sm break-words">
                           <div dangerouslySetInnerHTML={{ __html: result.explanation }} />
                         </div>
+                        {Array.isArray(result.priority_actions) && result.priority_actions.length > 0 && (
+                          <div className="mb-4 md:mb-6">
+                            <h4 className="font-mono text-sm md:text-base font-bold mb-3">FIX FIRST</h4>
+                            <div className="grid gap-3">
+                              {result.priority_actions.map((action) => (
+                                <div key={action.check} className="border-2 border-black dark:border-gray-600 p-3 bg-white dark:bg-gray-900">
+                                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
+                                    <div className="font-mono font-bold text-sm">{action.title}</div>
+                                    <div className="flex gap-2 font-mono text-[11px] uppercase">
+                                      <span className={`px-2 py-1 border border-black dark:border-gray-600 ${
+                                        action.severity === 'critical' || action.severity === 'high'
+                                          ? 'bg-red-500 text-white'
+                                          : action.severity === 'medium'
+                                            ? 'bg-yellow-400 text-black'
+                                            : 'bg-gray-200 dark:bg-gray-700'
+                                      }`}>
+                                        {action.severity}
+                                      </span>
+                                      <span className="px-2 py-1 border border-black dark:border-gray-600">Effort: {action.effort}</span>
+                                    </div>
+                                  </div>
+                                  <p className="text-sm text-gray-700 dark:text-gray-300 mb-2">{action.impact}</p>
+                                  <p className="text-sm font-medium">{action.fix}</p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         <Link
                           to="/learn"
                           className="block w-full bg-yellow-400 hover:bg-yellow-500 text-black border-2 border-black dark:border-gray-600 text-xs md:text-sm py-2 md:py-3 mb-3 md:mb-4 text-center font-bold transition-colors"
@@ -216,7 +262,7 @@ export default function SiteSecurityAnalyzer() {
                                     <tr key={key} className={`${index % 2 === 0 ? 'bg-gray-50 dark:bg-gray-900' : 'bg-white dark:bg-gray-800'} hover:bg-yellow-100 dark:hover:bg-gray-700 transition-colors`}>
                                       <td className="border border-black dark:border-gray-600 p-2 text-xs">{key}</td>
                                       <td className="border border-black dark:border-gray-600 p-2">
-                                        <span className={`inline-block px-2 py-1 font-bold text-xs ${value ? 'bg-green-500' : 'bg-red-300'}`}>
+                                        <span className={`inline-block px-2 py-1 font-bold text-xs ${isPassingCheck(key, value) ? 'bg-green-500' : 'bg-red-300'}`}>
                                           {value ? '✅' : '❌'}
                                         </span>
                                       </td>

@@ -8,6 +8,7 @@ import time
 import socket
 import ipaddress
 import datetime
+import re
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
@@ -18,6 +19,7 @@ import dns.resolver
 from celery import Celery, Task
 from celery.schedules import crontab
 import redis
+from core.report_builder import build_flat_report, compute_score_from_flat_report, enrich_scan_result
 
 # Inject Windows system certificates so HTTPS works without cert errors
 try:
@@ -45,9 +47,16 @@ celery.conf.update(
     worker_max_tasks_per_child=1000,  # Restart worker after 1000 tasks (prevent memory leaks)
 )
 
-# Redis for caching
+# Redis for caching. Celery still needs Redis as a broker, but scan result caching
+# should not make an otherwise successful worker task fail.
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+    redis_client.ping()
+    REDIS_CACHE_AVAILABLE = True
+except Exception:
+    redis_client = None
+    REDIS_CACHE_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────
 # Standalone SQLAlchemy session for the Celery worker process.
@@ -96,7 +105,7 @@ def _save_scan(user_id: int, url: str, domain: str, score: int,
             {
                 'uid': user_id, 'url': url, 'domain': domain,
                 'score': score, 'report': json.dumps(flat_report),
-                'dur': duration_ms, 'ts': _dt.datetime.utcnow().isoformat(),
+                'dur': duration_ms, 'ts': _dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'),
             }
         )
         session.commit()
@@ -374,29 +383,102 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     return findings
 
 
-def analyze_cookies(headers: Dict[str, str]) -> Dict[str, Any]:
-    """Analyze cookie security."""
-    set_cookie = headers.get('Set-Cookie', '')
-    
-    if not set_cookie:
-        return {'present': False, 'score': 0}
-    
-    issues = []
-    
-    if 'Secure' not in set_cookie:
-        issues.append('Missing Secure flag')
-    if 'HttpOnly' not in set_cookie:
-        issues.append('Missing HttpOnly flag')
-    if 'SameSite' not in set_cookie:
-        issues.append('Missing SameSite attribute')
-    
+def analyze_cookies(headers) -> Dict[str, Any]:
+    """Analyze all Set-Cookie headers using the nested scanner finding shape."""
+    if hasattr(headers, 'getlist'):
+        cookies = headers.getlist('Set-Cookie')
+    else:
+        raw = headers.get('Set-Cookie', '') if headers else ''
+        cookies = [c.strip() for c in raw.split('\n') if c.strip()] if raw else []
+
+    if not cookies:
+        return {
+            'cookies': {
+                'present': False,
+                'score': 0,
+                'severity': 'info',
+                'details': 'No cookies set - nothing to analyze'
+            }
+        }
+
+    all_issues = []
+    cookie_details = []
+    for cookie in cookies:
+        issues = []
+        lower_cookie = cookie.lower()
+        name = cookie.split('=')[0].strip() if '=' in cookie else cookie[:20]
+
+        if 'secure' not in lower_cookie:
+            issues.append('Missing Secure flag')
+        if 'httponly' not in lower_cookie:
+            issues.append('Missing HttpOnly flag')
+        if 'samesite' not in lower_cookie:
+            issues.append('Missing SameSite attribute')
+
+        all_issues.extend(issues)
+        cookie_details.append({
+            'name': name,
+            'issues': issues,
+            'ok': len(issues) == 0
+        })
+
+    unique_issues = sorted(set(all_issues))
     return {
-        'present': True,
-        'issues': issues,
-        'score': 0 if issues else 5,
-        'severity': 'warning' if issues else 'pass',
-        'details': f"Cookie security issues: {', '.join(issues)}" if issues else 'Cookies properly secured'
+        'cookies': {
+            'present': True,
+            'cookie_count': len(cookies),
+            'cookie_details': cookie_details,
+            'issues': unique_issues,
+            'score': 0 if unique_issues else 5,
+            'severity': 'warning' if unique_issues else 'pass',
+            'details': (
+                f"{len(all_issues)} cookie issue(s) across {len(cookies)} cookie(s)"
+                if unique_issues else
+                f"All {len(cookies)} cookie(s) properly secured"
+            )
+        }
     }
+
+
+def analyze_page_content(content: bytes, final_url: str) -> Dict[str, Any]:
+    """Analyze fetched HTML for lightweight client-side security signals."""
+    try:
+        text = content.decode('utf-8', errors='replace').lower()
+    except Exception:
+        return {'content_analyzed': False}
+
+    findings: Dict[str, Any] = {'content_analyzed': True}
+
+    if final_url.startswith('https://'):
+        mixed = re.findall(r'(?:src|href|action)=["\']http://[^"\']+["\']', text)
+        findings['mixed_content'] = {
+            'present': len(mixed) > 0,
+            'count': len(mixed),
+            'score': -5 if mixed else 0,
+            'severity': 'high' if mixed else 'pass',
+            'details': (
+                f"Found {len(mixed)} mixed content reference(s)"
+                if mixed else
+                'No mixed content detected'
+            )
+        }
+
+    inline_handlers = len(re.findall(r'\bon\w+\s*=\s*["\']', text))
+    findings['inline_event_handlers'] = {
+        'count': inline_handlers,
+        'score': -3 if inline_handlers > 5 else 0,
+        'severity': 'info' if inline_handlers > 5 else 'pass',
+        'details': f"{inline_handlers} inline event handler(s) detected"
+    }
+
+    inline_scripts = len(re.findall(r'<script(?:\s[^>]*)?>(?!.*src=)', text))
+    findings['inline_scripts'] = {
+        'count': inline_scripts,
+        'severity': 'info',
+        'details': f"{inline_scripts} inline script block(s) detected"
+    }
+
+    return findings
 
 
 def check_dns_records(domain: str) -> Dict[str, Any]:
@@ -405,7 +487,7 @@ def check_dns_records(domain: str) -> Dict[str, Any]:
     
     # SPF Check
     try:
-        txt_records = dns.resolver.resolve(domain, 'TXT', lifetime=5)
+        txt_records = dns.resolver.resolve(domain, 'TXT', lifetime=2.0)
         spf_found = False
         spf_record = None
         
@@ -434,7 +516,7 @@ def check_dns_records(domain: str) -> Dict[str, Any]:
     # DMARC Check
     try:
         dmarc_domain = f'_dmarc.{domain}'
-        dmarc_records = dns.resolver.resolve(dmarc_domain, 'TXT', lifetime=5)
+        dmarc_records = dns.resolver.resolve(dmarc_domain, 'TXT', lifetime=2.0)
         dmarc_found = False
         dmarc_record = None
         
@@ -483,12 +565,11 @@ def perform_security_scan(self, url: str, user_id: Optional[int] = None) -> Dict
     Includes all security checks with proper error handling.
     """
     start_time = time.time()
+    parsed = urlparse(url)
+    domain = parsed.hostname or ""
     
     try:
         self.update_state(state='PROGRESS', meta={'progress': 10, 'stage': 'Resolving DNS'})
-        
-        parsed = urlparse(url)
-        domain = parsed.hostname
         
         # Create safe session
         session = create_safe_session()
@@ -497,41 +578,36 @@ def perform_security_scan(self, url: str, user_id: Optional[int] = None) -> Dict
         self.update_state(state='PROGRESS', meta={'progress': 20, 'stage': 'Fetching headers'})
         
         # Make request with all safety measures
-        response = session.get(
+        with session.get(
             url,
             timeout=(5, SCAN_TIMEOUT),  # (connect, read) timeout
             allow_redirects=True,
             stream=True
-        )
-        
-        # Check content length before downloading
-        content_length = response.headers.get('content-length')
-        if content_length and int(content_length) > MAX_RESPONSE_SIZE:
-            return {
-                'error': 'Response too large',
-                'url': url,
-                'domain': domain
-            }
-        
-        # Read with limit
-        content = response.raw.read(MAX_RESPONSE_SIZE, decode_content=True)
-        if len(content) >= MAX_RESPONSE_SIZE:
-            return {
-                'error': 'Response too large',
-                'url': url,
-                'domain': domain
-            }
-        
-        headers = dict(response.headers)
+        ) as response:
+            content_length = response.headers.get('content-length')
+            if content_length and int(content_length) > MAX_RESPONSE_SIZE:
+                return {'error': 'Response too large', 'url': url, 'domain': domain}
+
+            content = response.raw.read(MAX_RESPONSE_SIZE + 1, decode_content=True)
+            if len(content) > MAX_RESPONSE_SIZE:
+                return {'error': 'Response too large', 'url': url, 'domain': domain}
+
+            raw_headers = response.headers
+            cookie_headers = getattr(response.raw, 'headers', response.headers)
+            final_url = response.url
+            status_code = response.status_code
         
         # Update progress
         self.update_state(state='PROGRESS', meta={'progress': 50, 'stage': 'Analyzing headers'})
         
         # Analyze security headers
-        header_findings = analyze_security_headers(headers, response.url)
+        header_findings = analyze_security_headers(raw_headers, final_url)
         
         # Analyze cookies
-        cookie_findings = analyze_cookies(headers)
+        cookie_findings = analyze_cookies(cookie_headers)
+
+        # Analyze page content
+        content_findings = analyze_page_content(content, final_url)
         
         # Update progress
         self.update_state(state='PROGRESS', meta={'progress': 70, 'stage': 'Checking DNS'})
@@ -543,53 +619,12 @@ def perform_security_scan(self, url: str, user_id: Optional[int] = None) -> Dict
         all_findings = {
             'headers': header_findings,
             'cookies': cookie_findings,
-            'dns': dns_findings
+            'dns': dns_findings,
+            'content': content_findings,
         }
         
-        # Calculate score
-        score = calculate_overall_score({**header_findings, **cookie_findings, **dns_findings})
-
-        # Build flat report — flat boolean keys that the frontend computeScore() expects.
-        # NOTE: celery_tasks uses 'csp' internally but the DB/frontend expect 'content_security_policy'.
-        flat_report = {
-            'https':                   header_findings.get('https', {}).get('present', False),
-            'hsts':                    header_findings.get('hsts', {}).get('present', False),
-            'content_security_policy': header_findings.get('csp', {}).get('present', False),
-            'x_frame_options':         header_findings.get('x_frame_options', {}).get('present', False),
-            'x_content_type_options':  header_findings.get('x_content_type_options', {}).get('present', False),
-            'referrer_policy':         header_findings.get('referrer_policy', {}).get('present', False),
-            'permissions_policy':      header_findings.get('permissions_policy', {}).get('present', False),
-            # server_disclosure key means the header IS present (leaking info), so True is bad
-            'server_header':           header_findings.get('server_disclosure', {}).get('present', False),
-            'dns_spf':                 dns_findings.get('spf', {}).get('present', False),
-            'dns_dmarc':               dns_findings.get('dmarc', {}).get('present', False),
-        }
-
-        # Build human-readable explanation for the frontend panel
-        passed = [k for k, v in flat_report.items() if k != 'server_header' and v]
-        failed = [k for k, v in flat_report.items() if k != 'server_header' and not v]
-        label_map = {
-            'https': 'HTTPS', 'hsts': 'HSTS', 'content_security_policy': 'CSP',
-            'x_frame_options': 'X-Frame-Options', 'x_content_type_options': 'X-Content-Type-Options',
-            'referrer_policy': 'Referrer-Policy', 'permissions_policy': 'Permissions-Policy',
-            'dns_spf': 'SPF', 'dns_dmarc': 'DMARC',
-        }
-        passed_labels = ', '.join(label_map.get(k, k) for k in passed) or 'None'
-        failed_labels = ', '.join(label_map.get(k, k) for k in failed) or 'None'
-        if score >= 80:
-            grade = 'Excellent'
-        elif score >= 60:
-            grade = 'Good'
-        elif score >= 40:
-            grade = 'Moderate'
-        else:
-            grade = 'Critical'
-        explanation = (
-            f'<strong>Security Grade: {grade} ({score}/100)</strong><br>'
-            f'<strong>Passed ({len(passed)}):</strong> {passed_labels}<br>'
-            f'<strong>Failed ({len(failed)}):</strong> {failed_labels}'
-            + (' <br><em>⚠️ Server version is disclosed in response headers.</em>' if flat_report.get('server_header') else '')
-        )
+        flat_report = build_flat_report(header_findings, dns_findings, cookie_findings, content_findings)
+        score = compute_score_from_flat_report(flat_report)
 
         # Update progress
         self.update_state(state='PROGRESS', meta={'progress': 90, 'stage': 'Saving results'})
@@ -598,19 +633,18 @@ def perform_security_scan(self, url: str, user_id: Optional[int] = None) -> Dict
         result = {
             'url': url,
             'domain': domain,
-            'score': score,
-            'report': flat_report,        # flat booleans for frontend computeScore()
             'findings': all_findings,     # rich nested data for detailed view
-            'explanation': explanation,
-            'final_url': response.url,
-            'status_code': response.status_code,
+            'final_url': final_url,
+            'status_code': status_code,
             'scan_duration_ms': int((time.time() - start_time) * 1000),
             'scanned_at': datetime.datetime.utcnow().isoformat()
         }
+        result = enrich_scan_result(result, flat_report, score)
         
         # Cache result (1 hour)
-        cache_key = f"scan:{domain}"
-        redis_client.setex(cache_key, 3600, json.dumps(result))
+        if REDIS_CACHE_AVAILABLE:
+            cache_key = f"scan:{domain}"
+            redis_client.setex(cache_key, 3600, json.dumps(result))
         
         # Save to database
         if user_id:
@@ -652,26 +686,39 @@ def perform_security_scan(self, url: str, user_id: Optional[int] = None) -> Dict
 @celery.task(name='scanner.cleanup_old_scans')
 def cleanup_old_scans():
     """Scheduled task to clean up scans older than 90 days."""
-    from app import db, Scan
-    
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=90)
-    deleted = Scan.query.filter(Scan.created_at < cutoff).delete()
-    db.session.commit()
-    
-    return f"Deleted {deleted} old scans"
+    session = _SessionFactory()
+    try:
+        cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=90)
+        result = session.execute(
+            _text("DELETE FROM scans WHERE created_at < :cutoff"),
+            {"cutoff": cutoff.strftime('%Y-%m-%d %H:%M:%S')}
+        )
+        session.commit()
+        return f"Deleted {result.rowcount} old scans"
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        _SessionFactory.remove()
 
 
 @celery.task(name='scanner.cleanup_expired_tokens')
 def cleanup_expired_tokens():
     """Scheduled task to clean up expired refresh tokens."""
-    from app import db, RefreshToken
-    
-    deleted = RefreshToken.query.filter(
-        RefreshToken.expires_at < datetime.datetime.utcnow()
-    ).delete()
-    db.session.commit()
-    
-    return f"Deleted {deleted} expired tokens"
+    session = _SessionFactory()
+    try:
+        now = _dt.datetime.utcnow()
+        result = session.execute(
+            _text("DELETE FROM refresh_tokens WHERE expires_at < :now"),
+            {"now": now.strftime('%Y-%m-%d %H:%M:%S')}
+        )
+        session.commit()
+        return f"Deleted {result.rowcount} expired tokens"
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        _SessionFactory.remove()
 
 
 # Scheduled tasks
