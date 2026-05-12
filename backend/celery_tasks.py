@@ -130,7 +130,14 @@ class SafeHTTPAdapter(HTTPAdapter):
         
         if hostname:
             try:
-                resolved_ips = socket.getaddrinfo(hostname, None)
+                # Bounded DNS resolution timeout to prevent hanging on slow lookups
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(5)
+                try:
+                    resolved_ips = socket.getaddrinfo(hostname, None)
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+
                 for ip_tuple in resolved_ips:
                     ip_str = ip_tuple[4][0]
                     if '%' in ip_str:
@@ -138,9 +145,17 @@ class SafeHTTPAdapter(HTTPAdapter):
                     
                     ip_obj = ipaddress.ip_address(ip_str)
                     
-                    if (ip_obj.is_private or ip_obj.is_loopback or 
+                    # Allow IPv6 NAT64 prefix (64:ff9b::/96)
+                    is_nat64 = (
+                        isinstance(ip_obj, ipaddress.IPv6Address)
+                        and ip_obj in ipaddress.IPv6Network('64:ff9b::/96')
+                    )
+                    
+                    if not is_nat64 and (
+                        ip_obj.is_private or ip_obj.is_loopback or 
                         ip_obj.is_link_local or ip_obj.is_multicast or 
-                        ip_obj.is_reserved):
+                        ip_obj.is_reserved
+                    ):
                         raise requests.exceptions.ConnectionError(
                             f"Blocked private IP in redirect: {ip_str}"
                         )
@@ -187,9 +202,12 @@ def create_safe_session() -> requests.Session:
     return session
 
 
-def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any]:
+def analyze_security_headers(headers, url: str) -> Dict[str, Any]:
     """
     Enhanced security header analysis.
+    
+    Accepts any mapping (CaseInsensitiveDict, plain dict, etc.).
+    Normalizes to a plain dict with lowercase keys for uniform access.
     
     Returns detailed findings for each security header including:
     - Presence check
@@ -197,6 +215,14 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     - Security score
     - Recommendations
     """
+    # Normalize: build a case-insensitive lookup via a lowercase-keyed dict
+    _h: Dict[str, str] = {}
+    for k, v in (headers or {}).items():
+        _h[k.lower()] = str(v) if v else ''
+
+    def _get(name: str) -> str:
+        return _h.get(name.lower(), '')
+
     findings = {}
     
     # HTTPS Check
@@ -208,7 +234,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     }
     
     # HSTS (Strict-Transport-Security)
-    hsts = headers.get('Strict-Transport-Security', '')
+    hsts = _get('strict-transport-security')
     if hsts:
         import re
         max_age_match = re.search(r'max-age=(\d+)', hsts)
@@ -249,7 +275,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
         }
     
     # CSP (Content-Security-Policy)
-    csp = headers.get('Content-Security-Policy', '')
+    csp = _get('content-security-policy')
     if csp:
         issues = []
         if "'unsafe-inline'" in csp:
@@ -283,7 +309,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
         }
     
     # X-Frame-Options
-    xfo = headers.get('X-Frame-Options', '').upper()
+    xfo = _get('x-frame-options').upper()
     if xfo in ('DENY', 'SAMEORIGIN'):
         findings['x_frame_options'] = {
             'present': True,
@@ -309,7 +335,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
         }
     
     # X-Content-Type-Options
-    xcto = headers.get('X-Content-Type-Options', '').lower()
+    xcto = _get('x-content-type-options').lower()
     findings['x_content_type_options'] = {
         'present': xcto == 'nosniff',
         'value': xcto if xcto else None,
@@ -319,7 +345,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     }
     
     # Referrer-Policy
-    rp = headers.get('Referrer-Policy', '')
+    rp = _get('referrer-policy')
     secure_policies = ['no-referrer', 'same-origin', 'strict-origin', 'strict-origin-when-cross-origin']
     findings['referrer_policy'] = {
         'present': bool(rp),
@@ -330,7 +356,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     }
     
     # Permissions-Policy / Feature-Policy
-    pp = headers.get('Permissions-Policy', headers.get('Feature-Policy', ''))
+    pp = _get('permissions-policy') or _get('feature-policy')
     findings['permissions_policy'] = {
         'present': bool(pp),
         'value': pp[:200] + '...' if len(pp) > 200 else pp,
@@ -340,7 +366,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
     }
     
     # X-XSS-Protection (deprecated but check for incorrect usage)
-    xxp = headers.get('X-XSS-Protection', '')
+    xxp = _get('x-xss-protection')
     if xxp == '0':
         findings['x_xss_protection'] = {
             'present': True,
@@ -359,7 +385,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
         }
     
     # Server Header (info disclosure)
-    server = headers.get('Server', '')
+    server = _get('server')
     if server:
         findings['server_disclosure'] = {
             'present': True,
@@ -370,7 +396,7 @@ def analyze_security_headers(headers: Dict[str, str], url: str) -> Dict[str, Any
         }
     
     # X-Powered-By (info disclosure)
-    xpb = headers.get('X-Powered-By', '')
+    xpb = _get('x-powered-by')
     if xpb:
         findings['x_powered_by'] = {
             'present': True,
@@ -546,13 +572,22 @@ def check_dns_records(domain: str) -> Dict[str, Any]:
 
 
 def calculate_overall_score(findings: Dict[str, Any]) -> int:
-    """Calculate overall security score from detailed findings."""
-    total_score = 50  # Base score
+    """DEPRECATED: use compute_score_from_flat_report() from core.report_builder instead.
     
+    Kept only for backwards compatibility with any existing Celery result data.
+    New code should NOT call this function.
+    """
+    import warnings
+    warnings.warn(
+        "calculate_overall_score() is deprecated. "
+        "Use compute_score_from_flat_report() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    total_score = 50  # Base score
     for category, data in findings.items():
         if isinstance(data, dict) and 'score' in data:
             total_score += data['score']
-    
     return max(0, min(100, total_score))
 
 

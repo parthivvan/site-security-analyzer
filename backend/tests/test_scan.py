@@ -1,13 +1,16 @@
+"""Core scan endpoint tests."""
 import unittest
 import sys
 import os
 import json
 from unittest.mock import patch
 
-# Add parent dir to path to import app
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import app, db, User, RefreshToken, generate_access_token, generate_refresh_token
+from app import app, db
+from models.user import User, RefreshToken
+from routes.auth import generate_access_token, generate_refresh_token
+
 
 class ScanTestCase(unittest.TestCase):
     def setUp(self):
@@ -60,8 +63,8 @@ class ScanTestCase(unittest.TestCase):
             def get(self, *_args, **_kwargs):
                 return FakeResponse()
 
-        with patch('celery_tasks.create_safe_session', return_value=FakeSession()), \
-             patch('celery_tasks.check_dns_records', return_value={
+        with patch('routes.scans.create_safe_session', return_value=FakeSession()), \
+             patch('routes.scans.check_dns_records', return_value={
                  'spf': {'present': True, 'score': 5},
                  'dmarc': {'present': False, 'score': 0},
              }):
@@ -77,7 +80,7 @@ class ScanTestCase(unittest.TestCase):
         self.assertTrue(data['report']['hsts'])
         self.assertIn('priority_actions', data)
         self.assertIn('risk_snapshot', data)
-        
+
     def test_scan_invalid_url(self):
         response = self.app.post('/scan', json={'url': ''}, headers=self.auth_headers)
         self.assertEqual(response.status_code, 400)
@@ -93,6 +96,7 @@ class ScanTestCase(unittest.TestCase):
         response = self.app.post('/auth/refresh', json={'refresh_token': plaintext})
         self.assertEqual(response.status_code, 200)
         self.assertIn('access_token', response.json)
+
 
 if __name__ == '__main__':
     unittest.main()

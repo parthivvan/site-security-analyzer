@@ -263,7 +263,7 @@ export default function SiteSecurityAnalyzer() {
                                       <td className="border border-black dark:border-gray-600 p-2 text-xs">{key}</td>
                                       <td className="border border-black dark:border-gray-600 p-2">
                                         <span className={`inline-block px-2 py-1 font-bold text-xs ${isPassingCheck(key, value) ? 'bg-green-500' : 'bg-red-300'}`}>
-                                          {value ? '✅' : '❌'}
+                                          {isPassingCheck(key, value) ? '✅' : '❌'}
                                         </span>
                                       </td>
                                     </tr>
